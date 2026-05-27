@@ -1,9 +1,7 @@
 """
 Train Vision Transformer for Brain Age Prediction
+FIXED: GPU support, correct hyperparameters, more epochs
 Run: python 3_train_vit.py
-
-Vision Transformer typically outperforms CNN by 0.5-1.5 years MAE
-Expected result: ~5.5-6.5 years MAE (better than CNN's 6.78)
 """
 
 import torch
@@ -20,156 +18,126 @@ from utils.dataset import BrainAgeDataset
 from models.vit_model import BrainAgeViT
 
 def set_seed(seed=42):
-    """Set random seeds for reproducibility"""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
 def denormalize_ages(ages_normalized, dataset):
-    """Convert normalized ages back to years"""
-    # Get base dataset if wrapped in Subset
     base_dataset = dataset.dataset if hasattr(dataset, 'dataset') else dataset
-    
-    ages_years = np.array(ages_normalized) * base_dataset.age_std + base_dataset.age_mean
-    return ages_years
+    return np.array(ages_normalized) * base_dataset.age_std + base_dataset.age_mean
 
-def train_epoch(model, loader, optimizer, criterion, device, dataset, grad_clip=5.0):
-    """Train for one epoch"""
+def train_epoch(model, loader, optimizer, criterion, device, dataset):
     model.train()
     total_loss = 0
     all_preds_norm = []
     all_targets_norm = []
-    
+
     pbar = tqdm(loader, desc="Training", leave=False)
     for images, ages_norm, _ in pbar:
         images = images.to(device)
         ages_norm = ages_norm.to(device)
-        
-        # Forward
+
         optimizer.zero_grad()
         preds_norm = model(images)
         loss = criterion(preds_norm, ages_norm)
-        
-        # Backward
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
-        
+
         total_loss += loss.item()
         all_preds_norm.extend(preds_norm.detach().cpu().numpy())
         all_targets_norm.extend(ages_norm.cpu().numpy())
-        
+
         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
-    # Denormalize for metrics
+
     preds_years = denormalize_ages(all_preds_norm, dataset)
     targets_years = denormalize_ages(all_targets_norm, dataset)
-    
     mae = np.mean(np.abs(preds_years - targets_years))
-    
+
     return total_loss / len(loader), mae
 
 def validate(model, loader, criterion, device, dataset):
-    """Validate the model"""
     model.eval()
     total_loss = 0
     all_preds_norm = []
     all_targets_norm = []
-    
+
     with torch.no_grad():
         for images, ages_norm, _ in tqdm(loader, desc="Validating", leave=False):
             images = images.to(device)
             ages_norm = ages_norm.to(device)
-            
+
             preds_norm = model(images)
             loss = criterion(preds_norm, ages_norm)
-            
+
             total_loss += loss.item()
             all_preds_norm.extend(preds_norm.cpu().numpy())
             all_targets_norm.extend(ages_norm.cpu().numpy())
-    
-    # Denormalize
+
     preds_years = denormalize_ages(all_preds_norm, dataset)
     targets_years = denormalize_ages(all_targets_norm, dataset)
-    
+
     mae = np.mean(np.abs(preds_years - targets_years))
     r = np.corrcoef(preds_years, targets_years)[0, 1] if len(preds_years) > 1 else 0.0
-    
+
     return total_loss / len(loader), mae, r, preds_years, targets_years
 
-def plot_training_results(history, preds, targets, save_path):
-    """Plot training history and predictions"""
+def plot_results(history, preds, targets, save_path):
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle('Vision Transformer Training Results', fontsize=16, fontweight='bold')
-    
-    # 1. MAE over epochs
-    axes[0, 0].plot(history['train_mae'], 'b-', label='Train', linewidth=2, marker='o', markersize=3)
-    axes[0, 0].plot(history['val_mae'], 'r-', label='Val', linewidth=2, marker='s', markersize=3)
-    best_epoch = np.argmin(history['val_mae'])
-    axes[0, 0].axvline(x=best_epoch, color='g', linestyle='--', alpha=0.5, linewidth=2)
-    axes[0, 0].set_xlabel('Epoch', fontsize=11)
-    axes[0, 0].set_ylabel('MAE (years)', fontsize=11)
-    axes[0, 0].set_title('Mean Absolute Error', fontsize=12, fontweight='bold')
-    axes[0, 0].legend(loc='upper right')
+
+    axes[0, 0].plot(history['train_mae'], 'b-', label='Train', linewidth=2)
+    axes[0, 0].plot(history['val_mae'], 'r-', label='Val', linewidth=2)
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('MAE (years)')
+    axes[0, 0].set_title('Mean Absolute Error')
+    axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
-    
-    # 2. Loss over epochs
+
     axes[0, 1].plot(history['train_loss'], 'b-', label='Train', linewidth=2)
     axes[0, 1].plot(history['val_loss'], 'r-', label='Val', linewidth=2)
-    axes[0, 1].set_xlabel('Epoch', fontsize=11)
-    axes[0, 1].set_ylabel('Loss (MSE)', fontsize=11)
-    axes[0, 1].set_title('Training Loss', fontsize=12, fontweight='bold')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].set_title('Training Loss')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
-    
-    # 3. Overfitting gap
+
     gap = [abs(t - v) for t, v in zip(history['train_mae'], history['val_mae'])]
-    axes[0, 2].plot(gap, 'orange', linewidth=2, marker='o', markersize=3)
-    axes[0, 2].axhline(y=2, color='g', linestyle='--', alpha=0.7, linewidth=2, label='Target < 2yr')
-    axes[0, 2].axhline(y=5, color='r', linestyle='--', alpha=0.5, linewidth=2, label='Overfitting > 5yr')
-    axes[0, 2].set_xlabel('Epoch', fontsize=11)
-    axes[0, 2].set_ylabel('|Train - Val| MAE', fontsize=11)
-    axes[0, 2].set_title('Overfitting Gap', fontsize=12, fontweight='bold')
+    axes[0, 2].plot(gap, 'orange', linewidth=2)
+    axes[0, 2].axhline(y=2, color='g', linestyle='--', label='Target < 2yr')
+    axes[0, 2].set_xlabel('Epoch')
+    axes[0, 2].set_ylabel('|Train - Val| MAE')
+    axes[0, 2].set_title('Overfitting Gap')
     axes[0, 2].legend()
     axes[0, 2].grid(True, alpha=0.3)
-    
-    # 4. Correlation over epochs
-    axes[1, 0].plot(history['val_r'], 'purple', linewidth=2, marker='o', markersize=3)
-    axes[1, 0].axhline(y=0.9, color='g', linestyle='--', alpha=0.5, linewidth=2, label='Target r > 0.9')
-    axes[1, 0].set_xlabel('Epoch', fontsize=11)
-    axes[1, 0].set_ylabel('Correlation (r)', fontsize=11)
-    axes[1, 0].set_title('Validation Correlation', fontsize=12, fontweight='bold')
-    axes[1, 0].legend()
+
+    axes[1, 0].plot(history['val_r'], 'purple', linewidth=2)
+    axes[1, 0].axhline(y=0.9, color='g', linestyle='--', alpha=0.5)
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Correlation (r)')
+    axes[1, 0].set_title('Validation Correlation')
     axes[1, 0].grid(True, alpha=0.3)
     axes[1, 0].set_ylim([0, 1])
-    
-    # 5. Scatter plot: Predicted vs Actual
-    axes[1, 1].scatter(targets, preds, alpha=0.6, s=40, edgecolors='k', linewidth=0.5)
-    axes[1, 1].plot([min(targets), max(targets)], [min(targets), max(targets)], 
-                    'r--', linewidth=2, label='Perfect prediction')
-    axes[1, 1].set_xlabel('Chronological Age (years)', fontsize=11)
-    axes[1, 1].set_ylabel('Predicted Age (years)', fontsize=11)
-    
+
+    axes[1, 1].scatter(targets, preds, alpha=0.6, s=40)
+    axes[1, 1].plot([min(targets), max(targets)], [min(targets), max(targets)], 'r--', lw=2)
+    axes[1, 1].set_xlabel('Chronological Age (years)')
+    axes[1, 1].set_ylabel('Predicted Age (years)')
     corr = np.corrcoef(preds, targets)[0, 1]
-    mae = np.mean(np.abs(np.array(preds) - np.array(targets)))
-    axes[1, 1].set_title(f'Final Predictions\nMAE={mae:.2f} years, r={corr:.3f}', 
-                        fontsize=12, fontweight='bold')
-    axes[1, 1].legend()
+    mae_val = np.mean(np.abs(np.array(preds) - np.array(targets)))
+    axes[1, 1].set_title(f'Predictions (MAE={mae_val:.2f}, r={corr:.3f})')
     axes[1, 1].grid(True, alpha=0.3)
-    
-    # 6. Residual plot
+
     residuals = np.array(preds) - np.array(targets)
-    axes[1, 2].scatter(targets, residuals, alpha=0.6, s=40, edgecolors='k', linewidth=0.5)
-    axes[1, 2].axhline(y=0, color='r', linestyle='--', linewidth=2, label='Zero error')
-    axes[1, 2].axhline(y=5, color='orange', linestyle='--', alpha=0.5, linewidth=1.5)
-    axes[1, 2].axhline(y=-5, color='orange', linestyle='--', alpha=0.5, linewidth=1.5)
-    axes[1, 2].set_xlabel('Chronological Age (years)', fontsize=11)
-    axes[1, 2].set_ylabel('Prediction Error (years)', fontsize=11)
-    axes[1, 2].set_title('Residual Plot', fontsize=12, fontweight='bold')
-    axes[1, 2].legend()
+    axes[1, 2].scatter(targets, residuals, alpha=0.6, s=40)
+    axes[1, 2].axhline(y=0, color='r', linestyle='--', lw=2)
+    axes[1, 2].set_xlabel('Chronological Age (years)')
+    axes[1, 2].set_ylabel('Error (years)')
+    axes[1, 2].set_title('Residual Plot')
     axes[1, 2].grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"📊 Plot saved: {save_path}")
@@ -177,170 +145,185 @@ def plot_training_results(history, preds, targets, save_path):
 
 def main():
     set_seed(42)
-    
+
     print("=" * 70)
     print(" " * 15 + "VISION TRANSFORMER TRAINING")
     print("=" * 70)
-    
-    # Hyperparameters (optimized for ViT)
-    BATCH_SIZE = 4 # Smaller batch for ViT (more memory intensive)
-    MAX_EPOCHS = 15
-    LEARNING_RATE = 1e-4  # Conservative LR for ViT
+
+    # ============================================================
+    # DEVICE SETUP - CRITICAL
+    # ============================================================
+    if torch.cuda.is_available():
+        DEVICE = torch.device('cuda')
+        print(f"\n✅ GPU DETECTED: {torch.cuda.get_device_name()}")
+        print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        BATCH_SIZE = 8
+    elif torch.backends.mps.is_available():
+        DEVICE = torch.device('mps')
+        print(f"\n✅ Apple Metal GPU DETECTED")
+        BATCH_SIZE = 16
+    else:
+        DEVICE = torch.device('cpu')
+        print(f"\n⚠️  WARNING: NO GPU DETECTED - Training on CPU!")
+        print(f"   This will be VERY slow (~16 hours)")
+        print(f"   Fix: Install CUDA PyTorch:")
+        print(f"   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118")
+        BATCH_SIZE = 4
+
+    # ============================================================
+    # HYPERPARAMETERS
+    # ============================================================
+    MAX_EPOCHS = 100    # FIXED: was 15, needs 100
+    LEARNING_RATE = 5e-4
     WEIGHT_DECAY = 1e-4
-    DROPOUT = 0.2  # Lower dropout for ViT
-    PATIENCE = 30
+    DROPOUT = 0.2
+    PATIENCE = 20       # FIXED: was 30 (too high relative to 15 epochs)
     GRAD_CLIP = 5.0
-    
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
     print(f"\n⚙️  Configuration:")
     print(f"   Device: {DEVICE}")
     print(f"   Batch size: {BATCH_SIZE}")
+    print(f"   Max epochs: {MAX_EPOCHS}")
     print(f"   Learning rate: {LEARNING_RATE}")
     print(f"   Weight decay: {WEIGHT_DECAY}")
     print(f"   Dropout: {DROPOUT}")
     print(f"   Patience: {PATIENCE}")
-    print(f"   Max epochs: {MAX_EPOCHS}")
-    
-    # Load datasets
+
+    # ============================================================
+    # DATASETS
+    # ============================================================
     print(f"\n{'='*70}")
     print("Loading Datasets")
     print("=" * 70)
-    
+
     train_dataset_full = BrainAgeDataset('data/processed', augment=True, use_3_slices=True)
     val_dataset_full = BrainAgeDataset('data/processed', augment=False, use_3_slices=True)
-    
-    # Train/val split (same as CNN for fair comparison)
+
     np.random.seed(42)
     indices = np.random.permutation(len(train_dataset_full))
     train_size = int(0.8 * len(indices))
-    
+
     train_dataset = Subset(train_dataset_full, indices[:train_size])
     val_dataset = Subset(val_dataset_full, indices[train_size:])
-    
+
+    # Use num_workers=0 on Windows to avoid multiprocessing issues
+    num_workers = 0 if torch.cuda.is_available() and \
+        'win' in __import__('sys').platform else 2
+
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=2,
-        pin_memory=True
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
     )
     val_loader = DataLoader(
-        val_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=False, 
-        num_workers=2,
-        pin_memory=True
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
     )
-    
+
     print(f"\n   Training: {len(train_dataset)} samples")
     print(f"   Validation: {len(val_dataset)} samples")
-    print(f"   Batch size: {BATCH_SIZE}")
-    
-    # Create Vision Transformer model
+
+    # ============================================================
+    # MODEL
+    # ============================================================
     print(f"\n{'='*70}")
     print("Building Vision Transformer")
     print("=" * 70)
-    
+
     model = BrainAgeViT(
         image_size=224,
         patch_size=16,
         num_channels=3,
-        dim=384,  # Embedding dimension
-        depth=6,  # Number of transformer layers
-        heads=6,  # Attention heads
-        mlp_dim=768,  # MLP hidden dimension
+        dim=384,
+        depth=6,
+        heads=6,
+        mlp_dim=768,
         dropout=DROPOUT
     ).to(DEVICE)
-    
+
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+
     print(f"\n   Model: Vision Transformer")
-    print(f"   Architecture:")
-    print(f"     - Patch size: 16 (224 → 196 patches)")
-    print(f"     - Embedding dim: 384")
-    print(f"     - Layers: 6")
-    print(f"     - Heads: 6")
     print(f"   Total parameters: {total_params:,}")
     print(f"   Trainable: {trainable_params:,}")
-    
-    # Training setup
-    criterion = nn.MSELoss()  # MSE for normalized ages
+
+    # ============================================================
+    # TRAINING SETUP
+    # ============================================================
+    criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(
-        model.parameters(), 
-        lr=LEARNING_RATE, 
+        model.parameters(),
+        lr=LEARNING_RATE,
         weight_decay=WEIGHT_DECAY,
         betas=(0.9, 0.999)
     )
-    
-    # Cosine annealing schedule with warm restart
+
+    # Cosine annealing - good for transformers
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        T_0=10,  # Period for cosine annealing
-        T_mult=2,  # Multiply period by 2 after each restart
+        T_0=10,
+        T_mult=2,
         eta_min=1e-6
     )
-    
-    # Training loop
+
+    # ============================================================
+    # TRAINING LOOP
+    # ============================================================
     print(f"\n{'='*70}")
     print("Training")
     print("=" * 70)
-    
+
     best_val_mae = float('inf')
     patience_counter = 0
     history = {
-        'train_loss': [],
-        'val_loss': [],
-        'train_mae': [],
-        'val_mae': [],
-        'val_r': [],
-        'learning_rates': []
+        'train_loss': [], 'val_loss': [],
+        'train_mae': [], 'val_mae': [],
+        'val_r': [], 'learning_rates': []
     }
-    
+
     start_time = time.time()
-    
+
     for epoch in range(MAX_EPOCHS):
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{MAX_EPOCHS}")
         print(f"{'='*70}")
-        
-        # Train
+
         train_loss, train_mae = train_epoch(
-            model, train_loader, optimizer, criterion, DEVICE, train_dataset, GRAD_CLIP
+            model, train_loader, optimizer, criterion, DEVICE, train_dataset
         )
-        
-        # Validate
+
         val_loss, val_mae, val_r, preds, targets = validate(
             model, val_loader, criterion, DEVICE, val_dataset
         )
-        
-        # Learning rate scheduling
+
         scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
-        
-        # Record history
+
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
         history['train_mae'].append(train_mae)
         history['val_mae'].append(val_mae)
         history['val_r'].append(val_r)
         history['learning_rates'].append(current_lr)
-        
+
         gap = abs(train_mae - val_mae)
-        
-        # Print results
+
         print(f"\n📊 Results:")
         print(f"   Train: Loss={train_loss:.4f}, MAE={train_mae:.2f} years")
         print(f"   Val:   Loss={val_loss:.4f}, MAE={val_mae:.2f} years, r={val_r:.3f}")
         print(f"   Gap: {gap:.2f} years {'✅' if gap < 2 else '⚠️' if gap < 5 else '❌'}")
         print(f"   LR: {current_lr:.2e}")
-        
-        # Save best model
+
         if val_mae < best_val_mae - 0.05:
             best_val_mae = val_mae
             patience_counter = 0
-            
+
             Path('outputs/models').mkdir(parents=True, exist_ok=True)
             torch.save({
                 'epoch': epoch + 1,
@@ -351,83 +334,72 @@ def main():
                 'val_r': val_r,
                 'history': history
             }, 'outputs/models/best_vit.pth')
-            
+
             print(f"   ✅ Best model saved! (MAE: {best_val_mae:.2f})")
         else:
             patience_counter += 1
             print(f"   ⏳ No improvement ({patience_counter}/{PATIENCE})")
-            
+
             if patience_counter >= PATIENCE:
                 print(f"\n🛑 Early stopping at epoch {epoch+1}")
                 break
-    
+
     total_time = time.time() - start_time
-    
-    # Final evaluation
+
+    # ============================================================
+    # FINAL RESULTS
+    # ============================================================
     print(f"\n{'='*70}")
     print("Final Evaluation")
     print("=" * 70)
-    
-    checkpoint = torch.load('outputs/models/best_vit.pth')
+
+    checkpoint = torch.load('outputs/models/best_vit.pth', map_location=DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
-    
+
     val_loss, val_mae, val_r, final_preds, final_targets = validate(
         model, val_loader, criterion, DEVICE, val_dataset
     )
-    
-    print(f"\n🏆 Best Model:")
-    print(f"   Val MAE: {val_mae:.2f} years")
-    print(f"   Correlation: {val_r:.3f}")
-    print(f"   Epoch: {checkpoint['epoch']}")
-    print(f"   Training time: {total_time/60:.1f} minutes")
-    
-    # Additional metrics
+
     residuals = np.array(final_preds) - np.array(final_targets)
-    rmse = np.sqrt(np.mean(residuals ** 2))
-    median_ae = np.median(np.abs(residuals))
-    
-    print(f"\n📊 Additional Metrics:")
-    print(f"   RMSE: {rmse:.2f} years")
-    print(f"   Median AE: {median_ae:.2f} years")
-    print(f"   Mean Error: {np.mean(residuals):.2f} years (bias)")
-    print(f"   Std of Error: {np.std(residuals):.2f} years")
-    
-    # Compare with CNN
-    print(f"\n📈 CNN vs ViT Comparison:")
-    print(f"   CNN Val MAE: 6.78 years")
-    print(f"   ViT Val MAE: {val_mae:.2f} years")
-    improvement = 6.78 - val_mae
-    if improvement > 0:
-        print(f"   ✅ ViT improved by {improvement:.2f} years!")
-    else:
-        print(f"   ⚠️  CNN was {-improvement:.2f} years better")
-    
-    # Plot results
+
+    print(f"\n🏆 Best ViT Model:")
+    print(f"   Val MAE:     {val_mae:.2f} years")
+    print(f"   Correlation: {val_r:.3f}")
+    print(f"   RMSE:        {np.sqrt(np.mean(residuals**2)):.2f} years")
+    print(f"   Best Epoch:  {checkpoint['epoch']}")
+    print(f"   Train Time:  {total_time/60:.1f} minutes")
+
+    cnn_path = Path('outputs/models/best_cnn.pth')
+    if cnn_path.exists():
+        cnn_ckpt = torch.load(cnn_path, map_location=DEVICE)
+        cnn_mae = cnn_ckpt['val_mae']
+        improvement = cnn_mae - val_mae
+        print(f"\n📈 CNN vs ViT:")
+        print(f"   CNN MAE: {cnn_mae:.2f} years")
+        print(f"   ViT MAE: {val_mae:.2f} years")
+        if improvement > 0:
+            print(f"   ✅ ViT improved by {improvement:.2f} years!")
+        else:
+            print(f"   ⚠️  CNN was {-improvement:.2f} years better")
+
     Path('outputs').mkdir(exist_ok=True)
-    plot_training_results(history, final_preds, final_targets, 'outputs/vit_training.png')
-    
-    # Save history
+    plot_results(history, final_preds, final_targets, 'outputs/vit_training.png')
+
     with open('outputs/vit_training_history.json', 'w') as f:
         json.dump({
             'history': history,
             'best_mae': float(val_mae),
             'best_r': float(val_r),
             'best_epoch': int(checkpoint['epoch']),
-            'total_time_minutes': float(total_time / 60),
-            'final_metrics': {
-                'rmse': float(rmse),
-                'median_ae': float(median_ae),
-                'mean_error': float(np.mean(residuals)),
-                'std_error': float(np.std(residuals))
-            }
+            'total_time_minutes': float(total_time / 60)
         }, f, indent=2)
-    
+
     print(f"\n{'='*70}")
     print("✅ VISION TRANSFORMER TRAINING COMPLETE!")
     print("=" * 70)
     print(f"\n📂 Outputs:")
-    print(f"   Model: outputs/models/best_vit.pth")
-    print(f"   Plots: outputs/vit_training.png")
+    print(f"   Model:   outputs/models/best_vit.pth")
+    print(f"   Plots:   outputs/vit_training.png")
     print(f"   History: outputs/vit_training_history.json")
 
 if __name__ == "__main__":
