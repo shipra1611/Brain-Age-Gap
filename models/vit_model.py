@@ -1,106 +1,79 @@
 """
-Vision Transformer for brain age prediction
+Pretrained Vision Transformer using timm library
+Uses DeiT-Small pretrained on ImageNet → fine-tuned for brain age
 """
 
 import torch
 import torch.nn as nn
 
+try:
+    import timm
+    TIMM_AVAILABLE = True
+except ImportError:
+    TIMM_AVAILABLE = False
+    print("timm not installed. Run: pip install timm")
+
+
 class BrainAgeViT(nn.Module):
     def __init__(
-        self, 
-        image_size=224, 
-        patch_size=16, 
+        self,
+        image_size=224,
+        patch_size=16,
         num_channels=3,
-        dim=384, 
-        depth=6, 
-        heads=6, 
+        dim=384,
+        depth=6,
+        heads=6,
         mlp_dim=768,
         dropout=0.1
     ):
         """
-        Vision Transformer for brain age regression
-        
-        Args:
-            image_size: Input image size
-            patch_size: Size of each patch
-            num_channels: Number of input channels
-            dim: Embedding dimension
-            depth: Number of transformer layers
-            heads: Number of attention heads
-            mlp_dim: MLP hidden dimension
-            dropout: Dropout rate
+        Pretrained ViT for brain age regression
+        Uses timm's pretrained deit_small_patch16_224
+        All other args kept for compatibility but not used
         """
         super(BrainAgeViT, self).__init__()
-        
-        assert image_size % patch_size == 0, "Image size must be divisible by patch size"
-        
-        num_patches = (image_size // patch_size) ** 2
-        patch_dim = num_channels * patch_size * patch_size
-        
-        self.patch_size = patch_size
-        self.dim = dim
-        
-        # Patch embedding
-        self.patch_embedding = nn.Linear(patch_dim, dim)
-        
-        # Positional embedding
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        
-        # CLS token
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim,
-            nhead=heads,
-            dim_feedforward=mlp_dim,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True
+
+        if not TIMM_AVAILABLE:
+            raise ImportError("Run: pip install timm")
+
+        # Load pretrained DeiT-Small (ImageNet pretrained)
+        # Much better than training from scratch with 322 samples!
+        self.backbone = timm.create_model(
+            'deit_small_patch16_224',
+            pretrained=True,
+            num_classes=0,      # Remove classification head
+            drop_rate=dropout,
+            drop_path_rate=0.1
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
-        
-        # Regression head
-        self.mlp_head = nn.Sequential(
-            nn.LayerNorm(dim),
+
+        # Get feature dimension from backbone
+        feature_dim = self.backbone.num_features  # 384 for deit_small
+
+        # Custom regression head for brain age
+        self.head = nn.Sequential(
+            nn.LayerNorm(feature_dim),
             nn.Dropout(dropout),
-            nn.Linear(dim, 256),
+            nn.Linear(feature_dim, 256),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 1)
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(128, 1)       # Predict normalized age
         )
-    
+
+        print(f"✅ Loaded pretrained DeiT-Small (ImageNet)")
+        print(f"   Feature dim: {feature_dim}")
+        total = sum(p.numel() for p in self.parameters())
+        print(f"   Total params: {total:,}")
+
     def forward(self, x):
         """
-        Forward pass
-        
         Args:
-            x: Input tensor (B, C, H, W)
+            x: Input tensor (B, 3, 224, 224)
         Returns:
             Predicted normalized age (B,)
         """
-        B = x.shape[0]
-        
-        # Create patches: (B, num_patches, patch_dim)
-        patches = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
-        patches = patches.contiguous().view(B, -1, self.patch_size * self.patch_size * x.shape[1])
-        
-        # Embed patches: (B, num_patches, dim)
-        x = self.patch_embedding(patches)
-        
-        # Add CLS token: (B, num_patches+1, dim)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)
-        
-        # Add positional embedding
-        x = x + self.pos_embedding
-        
-        # Transformer
-        x = self.transformer(x)
-        
-        # Use CLS token for prediction
-        cls_output = x[:, 0]
-        age = self.mlp_head(cls_output)
-        
+        features = self.backbone(x)   # (B, 384)
+        age      = self.head(features) # (B, 1)
         return age.squeeze(-1)
