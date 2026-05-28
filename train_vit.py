@@ -313,7 +313,7 @@ def main():
     print("Final Evaluation")
     print("=" * 70)
 
-    ckpt = torch.load('outputs/models/best_vit.pth', map_location=DEVICE)
+    ckpt = torch.load('outputs/models/best_vit.pth', map_location=DEVICE,weights_only=False)
     model.load_state_dict(ckpt['model_state_dict'])
 
     _, val_mae, val_r, final_preds, final_targets = validate(
