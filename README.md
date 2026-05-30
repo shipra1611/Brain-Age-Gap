@@ -114,7 +114,7 @@ The Vision Transformer achieved the best overall performance with lower predicti
 
 # Model Comparison
 
-![Model Comparison](outputs/subject_0000_gradcam.png)
+![Model Comparison](outputs/final_comparison.png)
 
 The residual analysis highlights:
 
@@ -134,7 +134,7 @@ Highlighted regions frequently aligned with known neuroanatomical aging areas in
 * cortical atrophy zones
 * ventricular enlargement patterns
 
-![GradCAM Visualization](assets/gradcam_example.png)
+![GradCAM Visualization](outputs/subject_0000_gradcam.png)
 
 ---
 
